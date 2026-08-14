@@ -41,6 +41,7 @@ class DouyinStoreFactory:
         "sqlite": DouyinSqliteStoreImplement,
         "mongodb": DouyinMongoStoreImplement,
         "excel": DouyinExcelStoreImplement,
+        "ruoyi": DouyinRuoyiStoreImplement,
     }
 
     @staticmethod
@@ -156,6 +157,14 @@ def _extract_music_download_url(aweme_detail: Dict) -> str:
 
 
 async def update_douyin_aweme(aweme_item: Dict):
+    try:
+        from integration.ruoyi_media.collector import get_active_collector
+
+        collector = get_active_collector()
+        if collector:
+            collector.capture_aweme(aweme_item)
+    except ImportError:
+        pass
     aweme_id = aweme_item.get("aweme_id")
     user_info = aweme_item.get("author", {})
     interact_info = aweme_item.get("statistics", {})
@@ -195,6 +204,14 @@ async def update_dy_aweme_comment(aweme_id: str, comment_item: Dict):
     if aweme_id != comment_aweme_id:
         utils.logger.error(f"[store.douyin.update_dy_aweme_comment] comment_aweme_id: {comment_aweme_id} != aweme_id: {aweme_id}")
         return
+    try:
+        from integration.ruoyi_media.collector import get_active_collector
+
+        collector = get_active_collector()
+        if collector:
+            collector.capture_comment(aweme_id, comment_item)
+    except ImportError:
+        pass
     user_info = comment_item.get("user", {})
     comment_id = comment_item.get("cid")
     parent_comment_id = comment_item.get("reply_id", "0")
@@ -217,7 +234,15 @@ async def update_dy_aweme_comment(aweme_id: str, comment_item: Dict):
 
 
 async def save_creator(user_id: str, creator: Dict):
-    # 教学版：创作者个人资料(昵称/性别/头像/签名/IP/粉丝数等)不再落库，防骚扰。
+    # 常规存储仍不落个人资料；仅 Java Worker 明确激活的任务在内存中暂存公开资料。
+    try:
+        from integration.ruoyi_media.collector import get_active_collector
+
+        collector = get_active_collector()
+        if collector:
+            collector.capture_creator(user_id, creator)
+    except ImportError:
+        pass
     return
 
 

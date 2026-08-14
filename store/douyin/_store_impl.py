@@ -218,6 +218,23 @@ class DouyinSqliteStoreImplement(DouyinDbStoreImplement):
     pass
 
 
+class DouyinRuoyiStoreImplement(AbstractStore):
+    """No-op persistence target used by the Java-controlled worker.
+
+    Raw crawl results are captured by the task-scoped in-memory collector before
+    the normal privacy-preserving store transformation is applied.
+    """
+
+    async def store_content(self, content_item: Dict):
+        pass
+
+    async def store_comment(self, comment_item: Dict):
+        pass
+
+    async def store_creator(self, creator: Dict):
+        pass
+
+
 class DouyinMongoStoreImplement(AbstractStore):
     """Douyin MongoDB storage implementation"""
 
