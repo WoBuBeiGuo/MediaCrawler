@@ -25,6 +25,7 @@ import asyncio
 import os
 import sys
 import subprocess
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
@@ -32,15 +33,55 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
+from integration.ruoyi_media.worker import run_worker
+from tools import utils
+
 from .routers import crawler_router, data_router, websocket_router
 
-# Project root directory (used for running subprocesses like uv run main.py)
+# Project root directory (used for running main.py subprocesses)
 PROJECT_ROOT = Path(__file__).parent.parent
 
+
+def _embedded_worker_enabled() -> bool:
+    value = os.getenv("RUOYI_MEDIA_EMBEDDED_WORKER", "true").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _log_worker_completion(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        utils.logger.error(f"[MediaCrawlerService] Embedded Worker stopped unexpectedly: {error}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run the Java ingestion Worker and WebUI API as one Python service."""
+    worker_task: asyncio.Task[None] | None = None
+    if _embedded_worker_enabled():
+        utils.logger.info("[MediaCrawlerService] Starting embedded RuoYi Media Worker")
+        worker_task = asyncio.create_task(run_worker(), name="ruoyi-media-worker")
+        worker_task.add_done_callback(_log_worker_completion)
+    else:
+        utils.logger.info("[MediaCrawlerService] Embedded Worker is disabled")
+    app.state.media_worker_task = worker_task
+
+    try:
+        yield
+    finally:
+        if worker_task is not None:
+            utils.logger.info("[MediaCrawlerService] Stopping embedded Worker and Chrome")
+            worker_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await worker_task
+
+
 app = FastAPI(
-    title="MediaCrawler WebUI API",
-    description="API for controlling MediaCrawler from WebUI",
-    version="1.0.0"
+    title="RuoYi MediaCrawler Service",
+    description="MediaCrawler WebUI API with embedded RuoYi ingestion Worker",
+    version="1.1.0",
+    lifespan=lifespan,
 )
 
 # Get webui static files directory
@@ -74,7 +115,7 @@ async def serve_frontend():
         return FileResponse(index_path)
     return {
         "message": "MediaCrawler WebUI API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "docs": "/docs",
         "note": "WebUI not found, please build it first: cd webui && npm run build"
     }
@@ -82,21 +123,39 @@ async def serve_frontend():
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok"}
+    worker_task: asyncio.Task[None] | None = getattr(app.state, "media_worker_task", None)
+    if worker_task is None:
+        worker_status = "disabled"
+        worker_error = None
+    elif not worker_task.done():
+        worker_status = "running"
+        worker_error = None
+    elif worker_task.cancelled():
+        worker_status = "stopped"
+        worker_error = None
+    else:
+        worker_status = "failed"
+        error = worker_task.exception()
+        worker_error = str(error)[:500] if error else None
+    return {
+        "status": "ok" if worker_status in {"running", "disabled"} else "degraded",
+        "workerStatus": worker_status,
+        "workerError": worker_error,
+    }
 
 
 @app.get("/api/env/check")
 async def check_environment():
     """Check if MediaCrawler environment is configured correctly"""
     try:
-        # Run uv run main.py --help command to check environment
-        # Use PROJECT_ROOT so it works regardless of where uvicorn was started
+        # Use the same Python interpreter as the WebUI API process. This keeps the
+        # native WebUI usable with the project's .venv and avoids a global uv dependency.
         if sys.platform == "win32":
             loop = asyncio.get_running_loop()
             process = await loop.run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    ["uv", "run", "main.py", "--help"],
+                    [sys.executable, "main.py", "--help"],
                     capture_output=True,
                     timeout=30.0,
                     cwd=str(PROJECT_ROOT)
@@ -105,7 +164,7 @@ async def check_environment():
             stdout, stderr = process.stdout, process.stderr  # bytes
         else:
             process = await asyncio.create_subprocess_exec(
-                "uv", "run", "main.py", "--help",
+                sys.executable, "main.py", "--help",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=str(PROJECT_ROOT)  # Project root directory
@@ -136,8 +195,8 @@ async def check_environment():
     except FileNotFoundError:
         return {
             "success": False,
-            "message": "uv command not found",
-            "error": "Please ensure uv is installed and configured in system PATH"
+            "message": "Python command not found",
+            "error": "Please start the WebUI API with the MediaCrawler virtual environment"
         }
     except Exception as e:
         return {

@@ -184,3 +184,6 @@ debug_tools
 
 database/*.db
 .omx/
+
+# Local startup secrets (MinIO credentials, private endpoints, etc.)
+/start.local.cmd

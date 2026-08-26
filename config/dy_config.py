@@ -44,3 +44,7 @@ DY_CREATOR_ID_LIST = [
     "MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE"
     # ........................
 ]
+
+# Post IDs that the RuoYi integration must not detail-crawl or collect comments for.
+# The Worker replaces this list for every claimed job.
+DY_EXCLUDED_ID_LIST = []

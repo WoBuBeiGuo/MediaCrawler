@@ -80,7 +80,7 @@ BROWSER_LAUNCH_TIMEOUT = 60
 # 用户需要在 Chrome 中开启远程调试：chrome://inspect/#remote-debugging
 # 或者使用命令行参数启动 Chrome：--remote-debugging-port=9222
 # 这种方式反检测效果最好，因为直接使用用户真实浏览器的所有 Cookie、扩展和浏览历史
-CDP_CONNECT_EXISTING = True
+CDP_CONNECT_EXISTING = False
 
 # 程序结束时是否自动关闭浏览器
 # 设置为 False 可以保持浏览器运行，方便调试
@@ -117,6 +117,12 @@ CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = 10
 # If the old version of the project uses db, you need to refer to schema/tables.sql line 287 to add table fields.
 ENABLE_GET_SUB_COMMENTS = False
 
+# Only fetch replies for high-engagement first-level comments. The native crawler
+# keeps its original behavior by default; the RuoYi worker enables this mode.
+ENABLE_GET_HOT_SUB_COMMENTS_ONLY = False
+HOT_COMMENT_TOP_N = 20
+HOT_COMMENT_LIKE_THRESHOLD = 50
+
 # word cloud related
 # Whether to enable generating comment word clouds
 ENABLE_GET_WORDCLOUD = False
@@ -134,7 +140,9 @@ STOP_WORDS_FILE = "./docs/hit_stopwords.txt"
 FONT_PATH = "./docs/STZHONGS.TTF"
 
 # Crawl interval
-CRAWLER_MAX_SLEEP_SEC = 2
+# Douyin API requests are serialized and delayed by a random interval in this range.
+CRAWLER_MIN_SLEEP_SEC = 3
+CRAWLER_MAX_SLEEP_SEC = 7
 
 # 是否禁用 SSL 证书验证。仅在使用企业代理、Burp Suite、mitmproxy 等会注入自签名证书的中间人代理时设为 True。
 # 警告：禁用 SSL 验证将使所有流量暴露于中间人攻击风险，请勿在生产环境中开启。

@@ -20,9 +20,11 @@
 import asyncio
 import copy
 import json
+import random
 import urllib.parse
-from typing import TYPE_CHECKING, Any, Callable, Dict, Union, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Union, Optional
 
+import config
 import httpx
 from playwright.async_api import BrowserContext
 
@@ -38,6 +40,10 @@ if TYPE_CHECKING:
 from .exception import *
 from .field import *
 from .help import *
+
+
+_DOUYIN_REQUEST_LOCK = asyncio.Lock()
+_DOUYIN_REQUEST_COUNT = 0
 
 
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
@@ -121,18 +127,33 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             params["a_bogus"] = a_bogus
 
     async def request(self, method, url, **kwargs):
-        # Check whether the proxy has expired before each request
-        await self._refresh_proxy_if_expired()
+        global _DOUYIN_REQUEST_COUNT
+        # Serialize Douyin API calls and wait a fresh random interval before every
+        # request after the first one.  The lock/count are shared by every client
+        # instance so two consecutive Worker jobs cannot create a request burst.
+        async with _DOUYIN_REQUEST_LOCK:
+            if _DOUYIN_REQUEST_COUNT > 0:
+                min_sleep = max(0.0, float(getattr(config, "CRAWLER_MIN_SLEEP_SEC", 3)))
+                max_sleep = max(min_sleep, float(getattr(config, "CRAWLER_MAX_SLEEP_SEC", 7)))
+                sleep_seconds = random.uniform(min_sleep, max_sleep)
+                utils.logger.info(
+                    f"[DouYinClient.request] Waiting {sleep_seconds:.2f}s before next API request"
+                )
+                await asyncio.sleep(sleep_seconds)
+            _DOUYIN_REQUEST_COUNT += 1
 
-        async with make_async_client(proxy=self.proxy) as client:
-            response = await client.request(method, url, timeout=self.timeout, **kwargs)
-        try:
-            if response.text == "" or response.text == "blocked":
-                utils.logger.error(f"request params incrr, response.text: {response.text}")
-                raise Exception("account blocked")
-            return response.json()
-        except Exception as e:
-            raise DataFetchError(f"{e}, {response.text}")
+            # Check whether the proxy has expired before each request
+            await self._refresh_proxy_if_expired()
+
+            async with make_async_client(proxy=self.proxy) as client:
+                response = await client.request(method, url, timeout=self.timeout, **kwargs)
+            try:
+                if response.text == "" or response.text == "blocked":
+                    utils.logger.error(f"request params incrr, response.text: {response.text}")
+                    raise Exception("account blocked")
+                return response.json()
+            except Exception as e:
+                raise DataFetchError(f"{e}, {response.text}")
 
     async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None):
         """
@@ -257,6 +278,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         is_fetch_sub_comments=False,
         callback: Optional[Callable] = None,
         max_count: int = 10,
+        sub_comments_selector: Optional[Callable[[List[Dict]], List[Dict]]] = None,
     ):
         """
         获取帖子的所有评论，包括子评论
@@ -268,45 +290,51 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         :return: 评论列表
         """
         result = []
+        first_level_comments = []
         comments_has_more = 1
         comments_cursor = 0
-        while comments_has_more and len(result) < max_count:
+        while comments_has_more and len(first_level_comments) < max_count:
             comments_res = await self.get_aweme_comments(aweme_id, comments_cursor)
             comments_has_more = comments_res.get("has_more", 0)
             comments_cursor = comments_res.get("cursor", 0)
             comments = comments_res.get("comments", [])
             if not comments:
                 continue
-            if len(result) + len(comments) > max_count:
-                comments = comments[:max_count - len(result)]
+            if len(first_level_comments) + len(comments) > max_count:
+                comments = comments[:max_count - len(first_level_comments)]
+            first_level_comments.extend(comments)
             result.extend(comments)
             if callback:  # If there is a callback function, execute the callback function
                 await callback(aweme_id, comments)
 
-            await asyncio.sleep(crawl_interval)
-            if not is_fetch_sub_comments:
+        if not is_fetch_sub_comments:
+            return result
+
+        reply_parents = (
+            sub_comments_selector(first_level_comments)
+            if sub_comments_selector is not None
+            else first_level_comments
+        )
+        # Fetch replies only after the first-level scan has completed. This lets
+        # callers rank the complete bounded sample and avoids spending requests
+        # on replies belonging to comments that will not be retained as hot.
+        for comment in reply_parents:
+            reply_comment_total = comment.get("reply_comment_total") or 0
+            if reply_comment_total <= 0:
                 continue
-            # Get secondary reviews
-            for comment in comments:
-                reply_comment_total = comment.get("reply_comment_total")
-
-                if reply_comment_total > 0:
-                    comment_id = comment.get("cid")
-                    sub_comments_has_more = 1
-                    sub_comments_cursor = 0
-
-                    while sub_comments_has_more:
-                        sub_comments_res = await self.get_sub_comments(aweme_id, comment_id, sub_comments_cursor)
-                        sub_comments_has_more = sub_comments_res.get("has_more", 0)
-                        sub_comments_cursor = sub_comments_res.get("cursor", 0)
-                        sub_comments = sub_comments_res.get("comments", [])
-
-                        if not sub_comments:
-                            continue
-                        result.extend(sub_comments)
-                        if callback:  # If there is a callback function, execute the callback function
-                            await callback(aweme_id, sub_comments)
-                        await asyncio.sleep(crawl_interval)
+            comment_id = comment.get("cid")
+            sub_comments_has_more = 1
+            sub_comments_cursor = 0
+            while sub_comments_has_more:
+                sub_comments_res = await self.get_sub_comments(aweme_id, comment_id, sub_comments_cursor)
+                sub_comments_has_more = sub_comments_res.get("has_more", 0)
+                sub_comments_cursor = sub_comments_res.get("cursor", 0)
+                sub_comments = sub_comments_res.get("comments", [])
+                if not sub_comments:
+                    continue
+                result.extend(sub_comments)
+                if callback:  # If there is a callback function, execute the callback function
+                    await callback(aweme_id, sub_comments)
         return result
 
     async def get_user_info(self, sec_user_id: str):

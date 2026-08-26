@@ -78,8 +78,13 @@ def test_collector_builds_creator_post_hot_comments_and_assets() -> None:
     assert payload["creator"]["platformCreatorId"] == "author-sec-uid"
     assert payload["creator"]["followerCount"] == 10000
     assert payload["posts"][0]["caption"] == "财经方法论示例"
-    assert {item["platformCommentId"] for item in payload["comments"]} == {"hot", "reply"}
-    assert payload["comments"][0]["isHot"] is True
+    comments = {item["platformCommentId"]: item for item in payload["comments"]}
+    assert set(comments) == {"hot", "cold", "reply"}
+    assert comments["hot"]["isHot"] is True
+    assert comments["cold"]["isHot"] is False
+    assert comments["cold"]["hotReason"] is None
+    assert comments["reply"]["isHot"] is True
+    assert comments["reply"]["hotReason"] == "HOT_REPLY"
     assert {item["assetType"] for item in payload["assets"]} == {"VIDEO", "COVER"}
 
 

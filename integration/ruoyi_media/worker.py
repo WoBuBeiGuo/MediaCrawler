@@ -30,6 +30,7 @@ import config
 from media_platform.douyin import DouYinCrawler
 from tools import utils
 
+from .browser_session import PersistentDouyinBrowser
 from .client import RuoyiMediaClient
 from .collector import DouyinJobCollector
 from .object_storage import MinioAssetStorage, MinioStorageSettings
@@ -40,6 +41,7 @@ SUPPORTED_JOB_TYPES = [
     "CREATOR_INCREMENTAL_SYNC",
     "POST_IMPORT",
     "POST_COMMENT_SYNC",
+    "POST_ASSET_REFRESH",
     "POST_MEDIA_DOWNLOAD",
 ]
 
@@ -59,6 +61,10 @@ class RuoyiMediaWorker:
         self.lease_seconds = max(30, min(1800, lease_seconds))
         self.poll_seconds = max(1.0, poll_seconds)
         self.storage = storage
+        self.browser_session = PersistentDouyinBrowser()
+
+    async def start(self) -> None:
+        await self.browser_session.get_context()
 
     async def run_once(self) -> bool:
         job = await self.client.claim(
@@ -74,9 +80,21 @@ class RuoyiMediaWorker:
     async def run_forever(self) -> None:
         utils.logger.info(f"[RuoyiMediaWorker] worker started: {self.worker_id}")
         while True:
-            handled = await self.run_once()
+            try:
+                handled = await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                utils.logger.error(
+                    f"[RuoyiMediaWorker] failed to claim a job; retrying in {self.poll_seconds}s: {exc}"
+                )
+                await asyncio.sleep(self.poll_seconds)
+                continue
             if not handled:
                 await asyncio.sleep(self.poll_seconds)
+
+    async def close(self) -> None:
+        await self.browser_session.close()
 
     async def _execute(self, job: dict[str, Any]) -> None:
         job_id = str(job["jobId"])
@@ -89,17 +107,28 @@ class RuoyiMediaWorker:
             name=f"ruoyi-heartbeat-{job_id}",
         )
         try:
+            if job["jobType"] == "POST_MEDIA_DOWNLOAD":
+                await self._download_stored_remote_assets(
+                    job_id,
+                    attempt_no,
+                    request_payload,
+                )
+                return
+
             self._configure_crawler(job)
             await self.client.heartbeat(
                 job_id,
                 self.worker_id,
                 attempt_no,
                 progress=10,
-                stage="STARTING_BROWSER",
+                stage="REFRESHING_ASSET_URLS"
+                if job["jobType"] == "POST_ASSET_REFRESH"
+                else "STARTING_BROWSER",
                 lease_seconds=self.lease_seconds,
             )
             collector.activate()
-            crawler = DouYinCrawler()
+            browser_context = await self.browser_session.get_context()
+            crawler = DouYinCrawler(browser_context=browser_context)
             await crawler.start()
             collector.deactivate()
 
@@ -114,6 +143,23 @@ class RuoyiMediaWorker:
             ingest_payload = collector.build_ingest_payload()
             if not ingest_payload["posts"]:
                 raise RuntimeError("Douyin crawl returned no post data")
+            if job["jobType"] == "POST_ASSET_REFRESH":
+                actual_asset_types = {
+                    str(asset.get("assetType") or "")
+                    for asset in ingest_payload["assets"]
+                    if asset.get("sourceUrl")
+                }
+                expected_asset_types = {
+                    str(asset_type)
+                    for asset_type in request_payload.get("expectedAssetTypes") or []
+                    if asset_type
+                }
+                if not actual_asset_types:
+                    raise RuntimeError("Douyin detail crawl returned no refreshable asset URLs")
+                missing_asset_types = expected_asset_types - actual_asset_types
+                if missing_asset_types:
+                    missing = ", ".join(sorted(missing_asset_types))
+                    raise RuntimeError(f"Douyin detail crawl did not refresh expected asset types: {missing}")
             download_requested = bool(request_payload.get("downloadMedia")) or job["jobType"] == "POST_MEDIA_DOWNLOAD"
             download_failures = 0
             if download_requested and self.storage is not None:
@@ -128,6 +174,35 @@ class RuoyiMediaWorker:
                 download_failures = await self._store_assets(ingest_payload)
                 self._update_post_media_status(ingest_payload)
             summary = await self._ingest_in_batches(job_id, attempt_no, ingest_payload)
+            if job["jobType"] == "POST_ASSET_REFRESH":
+                summary["refreshMode"] = "DETAIL_RECRAWL"
+                summary["refreshedAssetTypes"] = sorted(
+                    {
+                        str(asset.get("assetType"))
+                        for asset in ingest_payload["assets"]
+                        if asset.get("assetType") and asset.get("sourceUrl")
+                    }
+                )
+            if bool(request_payload.get("fetchComments")) or job["jobType"] == "POST_COMMENT_SYNC":
+                comment_policy = request_payload.get("commentPolicy") or {}
+                scan_limit = max(1, min(1000, int(comment_policy.get("sampleLimit") or 1000)))
+                first_level_counts: dict[str, int] = {}
+                hot_first_level = 0
+                hot_replies = 0
+                for comment in ingest_payload["comments"]:
+                    if comment.get("platformParentCommentId"):
+                        hot_replies += int(bool(comment.get("isHot")))
+                        continue
+                    post_id = str(comment.get("platformPostId") or "")
+                    first_level_counts[post_id] = first_level_counts.get(post_id, 0) + 1
+                    hot_first_level += int(bool(comment.get("isHot")))
+                summary["firstLevelComments"] = sum(first_level_counts.values())
+                summary["hotFirstLevelComments"] = hot_first_level
+                summary["hotReplies"] = hot_replies
+                summary["commentScanLimit"] = scan_limit
+                summary["reachedCommentScanLimit"] = any(
+                    count >= scan_limit for count in first_level_counts.values()
+                )
             summary["mediaStorage"] = "MINIO" if self.storage is not None and download_requested else "REMOTE_ONLY"
             summary["downloadFailures"] = download_failures
             storage_skipped = download_requested and self.storage is None
@@ -165,6 +240,98 @@ class RuoyiMediaWorker:
             if crawler is not None:
                 with suppress(Exception):
                     await crawler.close()
+
+    async def _download_stored_remote_assets(
+        self,
+        job_id: str,
+        attempt_no: int,
+        request_payload: dict[str, Any],
+    ) -> None:
+        """Download DB-provided remote URLs without opening Douyin or using cookies."""
+        assets = request_payload.get("assets") or []
+        if not isinstance(assets, list) or not assets:
+            raise RuntimeError("Media download job has no stored remote asset URLs")
+
+        await self.client.heartbeat(
+            job_id,
+            self.worker_id,
+            attempt_no,
+            progress=15,
+            stage="DOWNLOADING_REMOTE_MEDIA",
+            lease_seconds=self.lease_seconds,
+        )
+        if self.storage is None:
+            await self.client.complete(
+                job_id,
+                self.worker_id,
+                attempt_no,
+                status="PARTIAL",
+                result_summary={
+                    "assets": 0,
+                    "requestedAssets": len(assets),
+                    "downloadFailures": 0,
+                    "mediaStorage": "REMOTE_ONLY",
+                    "mediaStorageSkipped": True,
+                    "downloadMode": "ANONYMOUS_HTTP",
+                },
+                error_code="MINIO_NOT_CONFIGURED",
+                error_message="MinIO is not configured; remote URLs were not downloaded",
+            )
+            return
+
+        ingest_payload = {"assets": [dict(asset) for asset in assets]}
+        download_failures = await self._store_assets(ingest_payload)
+        await self.client.heartbeat(
+            job_id,
+            self.worker_id,
+            attempt_no,
+            progress=90,
+            stage="UPDATING_MEDIA_ASSETS",
+            lease_seconds=self.lease_seconds,
+        )
+        await self.client.ingest(
+            job_id,
+            self.worker_id,
+            attempt_no,
+            {
+                "creator": None,
+                "posts": [],
+                "comments": [],
+                "assets": ingest_payload["assets"],
+                "rawPayloads": [],
+            },
+        )
+
+        succeeded = len(assets) - download_failures
+        status = "SUCCEEDED"
+        if download_failures == len(assets):
+            status = "FAILED"
+        elif download_failures:
+            status = "PARTIAL"
+        summary = {
+            "assets": len(assets),
+            "downloadedAssets": succeeded,
+            "downloadFailures": download_failures,
+            "mediaStorage": "MINIO",
+            "mediaStorageSkipped": False,
+            "downloadMode": "ANONYMOUS_HTTP",
+        }
+        await self.client.complete(
+            job_id,
+            self.worker_id,
+            attempt_no,
+            status=status,
+            result_summary=summary,
+            error_code="REMOTE_DOWNLOAD_FAILED" if download_failures else None,
+            error_message=(
+                f"{download_failures} of {len(assets)} remote assets failed to download"
+                if download_failures
+                else None
+            ),
+        )
+        utils.logger.info(
+            f"[RuoyiMediaWorker] anonymous remote download completed: {job_id}, summary={summary}"
+        )
 
     async def _heartbeat_loop(self, job_id: str, attempt_no: int) -> None:
         interval = max(10, self.lease_seconds // 3)
@@ -261,11 +428,21 @@ class RuoyiMediaWorker:
         config.SAVE_DATA_OPTION = "ruoyi"
         config.ENABLE_GET_MEIDAS = False
         config.MAX_CONCURRENCY_NUM = 1
-        config.CRAWLER_MAX_SLEEP_SEC = max(1, config.CRAWLER_MAX_SLEEP_SEC)
+        config.CRAWLER_MIN_SLEEP_SEC = max(0, config.CRAWLER_MIN_SLEEP_SEC)
+        config.CRAWLER_MAX_SLEEP_SEC = max(config.CRAWLER_MIN_SLEEP_SEC, config.CRAWLER_MAX_SLEEP_SEC)
+        config.DY_EXCLUDED_ID_LIST = [
+            str(post_id)
+            for post_id in payload.get("excludedPostIds") or []
+            if post_id
+        ]
 
         comment_policy = payload.get("commentPolicy") or {}
-        config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = int(comment_policy.get("sampleLimit") or 100)
+        scan_limit = int(comment_policy.get("sampleLimit") or 1000)
+        config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = max(1, min(1000, scan_limit))
         config.ENABLE_GET_SUB_COMMENTS = bool(comment_policy.get("fetchHotReplies", True))
+        config.ENABLE_GET_HOT_SUB_COMMENTS_ONLY = True
+        config.HOT_COMMENT_TOP_N = max(1, int(comment_policy.get("hotTopN") or 20))
+        config.HOT_COMMENT_LIKE_THRESHOLD = max(0, int(comment_policy.get("likeThreshold") or 50))
 
         if job_type.startswith("CREATOR_"):
             creator_source = payload.get("profileUrl") or payload.get("platformCreatorId")
@@ -273,7 +450,7 @@ class RuoyiMediaWorker:
                 raise ValueError("Creator task is missing profileUrl/platformCreatorId")
             config.CRAWLER_TYPE = "creator"
             config.DY_CREATOR_ID_LIST = [creator_source]
-            config.ENABLE_GET_COMMENTS = True
+            config.ENABLE_GET_COMMENTS = bool(payload.get("fetchComments", False))
             return
 
         source_url = payload.get("sourceUrl") or payload.get("canonicalUrl")
@@ -300,22 +477,63 @@ def _parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = _parse_args()
+
+    await run_worker(
+        once=args.once,
+        base_url=args.base_url,
+        token=args.token,
+        worker_id=args.worker_id,
+        lease_seconds=args.lease_seconds,
+        poll_seconds=args.poll_seconds,
+    )
+
+
+async def run_worker(
+    *,
+    once: bool = False,
+    base_url: str | None = None,
+    token: str | None = None,
+    worker_id: str | None = None,
+    lease_seconds: int | None = None,
+    poll_seconds: float | None = None,
+) -> None:
+    """Run the RuoYi worker standalone or inside the WebUI API lifespan."""
+    resolved_base_url = base_url if base_url is not None else os.getenv(
+        "RUOYI_MEDIA_BASE_URL", "http://127.0.0.1:8080"
+    )
+    resolved_token = token if token is not None else os.getenv(
+        "RUOYI_MEDIA_WORKER_TOKEN", "ruoyi-media-dev-token"
+    )
+    resolved_worker_id = worker_id or os.getenv(
+        "RUOYI_MEDIA_WORKER_ID", f"{socket.gethostname()}-{os.getpid()}"
+    )
+    resolved_lease_seconds = lease_seconds if lease_seconds is not None else int(
+        os.getenv("RUOYI_MEDIA_LEASE_SECONDS", "120")
+    )
+    resolved_poll_seconds = poll_seconds if poll_seconds is not None else float(
+        os.getenv("RUOYI_MEDIA_POLL_SECONDS", "5")
+    )
+
     storage_settings = MinioStorageSettings.from_env()
     storage = MinioAssetStorage(storage_settings) if storage_settings else None
-    async with RuoyiMediaClient(args.base_url, args.token) as client:
+    async with RuoyiMediaClient(resolved_base_url, resolved_token) as client:
         worker = RuoyiMediaWorker(
             client,
-            args.worker_id,
-            lease_seconds=args.lease_seconds,
-            poll_seconds=args.poll_seconds,
+            resolved_worker_id,
+            lease_seconds=resolved_lease_seconds,
+            poll_seconds=resolved_poll_seconds,
             storage=storage,
         )
-        if args.once:
-            handled = await worker.run_once()
-            if not handled:
-                utils.logger.info("[RuoyiMediaWorker] no pending job")
-        else:
-            await worker.run_forever()
+        try:
+            await worker.start()
+            if once:
+                handled = await worker.run_once()
+                if not handled:
+                    utils.logger.info("[RuoyiMediaWorker] no pending job")
+            else:
+                await worker.run_forever()
+        finally:
+            await worker.close()
 
 
 if __name__ == "__main__":

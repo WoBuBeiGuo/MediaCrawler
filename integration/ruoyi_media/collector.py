@@ -81,7 +81,7 @@ class DouyinJobCollector:
         comments: list[dict[str, Any]] = []
         assets: list[dict[str, Any]] = []
         for aweme_id, aweme in self.awemes.items():
-            comments.extend(self._build_hot_comments(aweme_id, aweme))
+            comments.extend(self._build_comments(aweme_id, aweme))
             assets.extend(self._build_assets(aweme))
         return {
             "creator": creator,
@@ -144,12 +144,15 @@ class DouyinJobCollector:
             "collectCount": _integer(statistics.get("collect_count")),
             "shareCount": _integer(statistics.get("share_count")),
             "mediaStatus": "PENDING",
-            "commentStatus": "SUCCEEDED" if self.comments.get(aweme_id) is not None else "PENDING",
+            "commentStatus": "SUCCEEDED" if (
+                bool(self.request_payload.get("fetchComments"))
+                or self.comments.get(aweme_id) is not None
+            ) else "PENDING",
             "visibilityStatus": "VISIBLE",
             "collectedAt": _now_text(),
         }
 
-    def _build_hot_comments(self, aweme_id: str, aweme: dict[str, Any]) -> list[dict[str, Any]]:
+    def _build_comments(self, aweme_id: str, aweme: dict[str, Any]) -> list[dict[str, Any]]:
         source = list(self.comments.get(aweme_id, {}).values())
         if not source:
             return []
@@ -157,49 +160,52 @@ class DouyinJobCollector:
         top_n = max(1, int(policy.get("hotTopN") or 20))
         like_threshold = max(0, int(policy.get("likeThreshold") or 50))
         include_replies = bool(policy.get("fetchHotReplies", True))
-        ranked = sorted(source, key=lambda item: _integer(item.get("digg_count")) or 0, reverse=True)
+        first_level = [item for item in source if not _parent_comment_id(item)]
+        replies = [item for item in source if _parent_comment_id(item)]
+        ranked = sorted(first_level, key=lambda item: _integer(item.get("digg_count")) or 0, reverse=True)
         hot_ids = {
             str(item.get("cid"))
             for rank, item in enumerate(ranked, start=1)
             if rank <= top_n or (_integer(item.get("digg_count")) or 0) >= like_threshold or _is_pinned(item)
         }
-        if include_replies:
-            for item in source:
-                parent_id = _parent_comment_id(item)
-                if parent_id in hot_ids:
-                    hot_ids.add(str(item.get("cid")))
 
         author = aweme.get("author") or {}
         author_ids = {str(author.get(key)) for key in ("uid", "sec_uid") if author.get(key)}
         result: list[dict[str, Any]] = []
         for rank, item in enumerate(ranked, start=1):
             comment_id = str(item.get("cid") or "")
-            if comment_id not in hot_ids:
-                continue
-            user = item.get("user") or {}
-            user_id = user.get("sec_uid") or user.get("uid")
             like_count = _integer(item.get("digg_count")) or 0
+            is_hot = comment_id in hot_ids
+            hot_reason = None
+            if is_hot:
+                hot_reason = (
+                    "PINNED" if _is_pinned(item)
+                    else ("LIKE_THRESHOLD" if like_count >= like_threshold else "TOP_LIKED")
+                )
             result.append(
-                {
-                    "platform": "DOUYIN",
-                    "platformPostId": aweme_id,
-                    "platformCommentId": comment_id,
-                    "platformParentCommentId": _parent_comment_id(item) or None,
-                    "commenterId": _string_or_none(user_id),
-                    "commenterNickname": user.get("nickname"),
-                    "commenterAvatarUrl": _first_url(user.get("avatar_medium") or user.get("avatar_thumb")),
-                    "content": item.get("text") or "",
-                    "likeCount": like_count,
-                    "replyCount": _integer(item.get("reply_comment_total")) or 0,
-                    "publishedAt": _timestamp_text(item.get("create_time")),
-                    "isCreator": str(user_id) in author_ids if user_id else False,
-                    "isPinned": _is_pinned(item),
-                    "isHot": True,
-                    "hotReason": "PINNED" if _is_pinned(item) else ("LIKE_THRESHOLD" if like_count >= like_threshold else "TOP_LIKED"),
-                    "sampleRank": rank,
-                    "imageUrls": _comment_image_urls(item),
-                }
+                _build_comment_payload(
+                    aweme_id,
+                    item,
+                    author_ids,
+                    is_hot=is_hot,
+                    hot_reason=hot_reason,
+                    sample_rank=rank,
+                )
             )
+        if include_replies:
+            for item in replies:
+                if _parent_comment_id(item) not in hot_ids:
+                    continue
+                result.append(
+                    _build_comment_payload(
+                        aweme_id,
+                        item,
+                        author_ids,
+                        is_hot=True,
+                        hot_reason="HOT_REPLY",
+                        sample_rank=None,
+                    )
+                )
         return result
 
     def _build_assets(self, aweme: dict[str, Any]) -> list[dict[str, Any]]:
@@ -275,6 +281,38 @@ def _comment_image_urls(comment: dict[str, Any]) -> list[str]:
         if url:
             result.append(url)
     return result
+
+
+def _build_comment_payload(
+    aweme_id: str,
+    item: dict[str, Any],
+    author_ids: set[str],
+    *,
+    is_hot: bool,
+    hot_reason: str | None,
+    sample_rank: int | None,
+) -> dict[str, Any]:
+    user = item.get("user") or {}
+    user_id = user.get("sec_uid") or user.get("uid")
+    return {
+        "platform": "DOUYIN",
+        "platformPostId": aweme_id,
+        "platformCommentId": str(item.get("cid") or ""),
+        "platformParentCommentId": _parent_comment_id(item) or None,
+        "commenterId": _string_or_none(user_id),
+        "commenterNickname": user.get("nickname"),
+        "commenterAvatarUrl": _first_url(user.get("avatar_medium") or user.get("avatar_thumb")),
+        "content": item.get("text") or "",
+        "likeCount": _integer(item.get("digg_count")) or 0,
+        "replyCount": _integer(item.get("reply_comment_total")) or 0,
+        "publishedAt": _timestamp_text(item.get("create_time")),
+        "isCreator": str(user_id) in author_ids if user_id else False,
+        "isPinned": _is_pinned(item),
+        "isHot": is_hot,
+        "hotReason": hot_reason,
+        "sampleRank": sample_rank,
+        "imageUrls": _comment_image_urls(item),
+    }
 
 
 def _parent_comment_id(comment: dict[str, Any]) -> str:
