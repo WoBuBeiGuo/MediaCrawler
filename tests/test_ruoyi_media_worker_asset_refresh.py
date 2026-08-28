@@ -68,8 +68,11 @@ def test_creator_job_configures_excluded_member_posts(monkeypatch: Any) -> None:
 
 
 class _AnonymousPage:
-    async def goto(self, _url: str) -> None:
-        return None
+    def __init__(self) -> None:
+        self.goto_calls: list[str] = []
+
+    async def goto(self, url: str) -> None:
+        self.goto_calls.append(url)
 
 
 class _AnonymousBrowserContext:
@@ -139,12 +142,11 @@ async def test_anonymous_detail_never_falls_back_to_login(monkeypatch: Any) -> N
     monkeypatch.setattr(config, "CRAWLER_TYPE", "detail")
     monkeypatch.setattr(douyin_core, "DouYinLogin", _ForbiddenLogin)
     context = _AnonymousBrowserContext()
-    client = _AnonymousDouyinClient()
     detail_called = False
     crawler = DouYinCrawler(cast(Any, context), allow_login=False)
 
     async def create_client(_proxy: str | None) -> _AnonymousDouyinClient:
-        return client
+        raise AssertionError("anonymous detail mode must not create the HTTP API client")
 
     async def fetch_detail() -> None:
         nonlocal detail_called
@@ -156,7 +158,7 @@ async def test_anonymous_detail_never_falls_back_to_login(monkeypatch: Any) -> N
     await crawler._run_with_browser_context(None)
 
     assert detail_called is True
-    assert client.cookie_updates == 1
+    assert context.page.goto_calls == []
     assert crawler._allow_login is False
 
 @pytest.mark.asyncio

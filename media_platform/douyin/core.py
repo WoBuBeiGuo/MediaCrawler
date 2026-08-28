@@ -167,10 +167,26 @@ class DouYinCrawler(AbstractCrawler):
     async def _run_with_browser_context(self, httpx_proxy_format: Optional[str]) -> None:
         """Run one crawl job in the current browser context."""
         self.context_page = await self.browser_context.new_page()
-        await self.context_page.goto(self.index_url)
+
+        if not self._allow_login:
+            if config.CRAWLER_TYPE != "detail":
+                raise RuntimeError("Anonymous browser mode only supports detail tasks")
+            crawler_type_var.set(config.CRAWLER_TYPE)
+            utils.logger.info(
+                "[DouYinCrawler] Anonymous detail mode enabled; skipping home page and login checks"
+            )
+            await self.get_specified_awemes()
+            utils.logger.info("[DouYinCrawler.start] Douyin Crawler finished ...")
+            return
+
+        await self.context_page.goto(
+            self.index_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
 
         self.dy_client = await self.create_douyin_client(httpx_proxy_format)
-        if not await self.dy_client.pong(browser_context=self.browser_context) and self._allow_login:
+        if not await self.dy_client.pong(browser_context=self.browser_context):
             login_obj = DouYinLogin(
                 login_type=config.LOGIN_TYPE,
                 login_phone="",  # you phone number
@@ -182,16 +198,6 @@ class DouYinCrawler(AbstractCrawler):
             await self.dy_client.update_cookies(
                 browser_context=self.browser_context,
                 urls=self.cookie_urls,
-            )
-        elif not self._allow_login:
-            # Anonymous detail mode deliberately keeps the isolated context free
-            # of account cookies and must never fall back to QR/cookie login.
-            await self.dy_client.update_cookies(
-                browser_context=self.browser_context,
-                urls=self.cookie_urls,
-            )
-            utils.logger.info(
-                "[DouYinCrawler] Anonymous mode enabled; login fallback is disabled"
             )
         crawler_type_var.set(config.CRAWLER_TYPE)
         if config.CRAWLER_TYPE == "search":
