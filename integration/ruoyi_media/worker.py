@@ -464,7 +464,7 @@ class RuoyiMediaWorker:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MediaCrawler worker for RuoYi Media")
     parser.add_argument("--once", action="store_true", help="claim at most one job and exit")
-    parser.add_argument("--base-url", default=os.getenv("RUOYI_MEDIA_BASE_URL", "http://127.0.0.1:8080"))
+    parser.add_argument("--base-url", default=os.getenv("RUOYI_MEDIA_BASE_URL", "http://10.200.77.58:43300"))
     parser.add_argument("--token", default=os.getenv("RUOYI_MEDIA_WORKER_TOKEN", "ruoyi-media-dev-token"))
     parser.add_argument(
         "--worker-id",
@@ -499,7 +499,7 @@ async def run_worker(
 ) -> None:
     """Run the RuoYi worker standalone or inside the WebUI API lifespan."""
     resolved_base_url = base_url if base_url is not None else os.getenv(
-        "RUOYI_MEDIA_BASE_URL", "http://127.0.0.1:8080"
+        "RUOYI_MEDIA_BASE_URL", "http://10.200.77.58:43300"
     )
     resolved_token = token if token is not None else os.getenv(
         "RUOYI_MEDIA_WORKER_TOKEN", "ruoyi-media-dev-token"
