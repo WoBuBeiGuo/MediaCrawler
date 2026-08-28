@@ -71,7 +71,12 @@ class DouYinCrawler(AbstractCrawler):
     browser_context: BrowserContext
     cdp_manager: Optional[CDPBrowserManager]
 
-    def __init__(self, browser_context: Optional[BrowserContext] = None) -> None:
+    def __init__(
+        self,
+        browser_context: Optional[BrowserContext] = None,
+        *,
+        allow_login: bool = True,
+    ) -> None:
         self.index_url = "https://www.douyin.com"
         self.cookie_urls = [
             "https://douyin.com",
@@ -82,6 +87,7 @@ class DouYinCrawler(AbstractCrawler):
         ]
         self.cdp_manager = None
         self._shared_browser_context = browser_context is not None
+        self._allow_login = allow_login
         if browser_context is not None:
             self.browser_context = browser_context
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
@@ -129,7 +135,7 @@ class DouYinCrawler(AbstractCrawler):
         await self.context_page.goto(self.index_url)
 
         self.dy_client = await self.create_douyin_client(httpx_proxy_format)
-        if not await self.dy_client.pong(browser_context=self.browser_context):
+        if not await self.dy_client.pong(browser_context=self.browser_context) and self._allow_login:
             login_obj = DouYinLogin(
                 login_type=config.LOGIN_TYPE,
                 login_phone="",  # you phone number
@@ -141,6 +147,16 @@ class DouYinCrawler(AbstractCrawler):
             await self.dy_client.update_cookies(
                 browser_context=self.browser_context,
                 urls=self.cookie_urls,
+            )
+        elif not self._allow_login:
+            # Anonymous detail mode deliberately keeps the isolated context free
+            # of account cookies and must never fall back to QR/cookie login.
+            await self.dy_client.update_cookies(
+                browser_context=self.browser_context,
+                urls=self.cookie_urls,
+            )
+            utils.logger.info(
+                "[DouYinCrawler] Anonymous mode enabled; login fallback is disabled"
             )
         crawler_type_var.set(config.CRAWLER_TYPE)
         if config.CRAWLER_TYPE == "search":

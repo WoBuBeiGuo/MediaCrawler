@@ -102,6 +102,7 @@ class RuoyiMediaWorker:
         request_payload = job.get("requestPayload") or {}
         collector = DouyinJobCollector(request_payload)
         crawler: DouYinCrawler | None = None
+        anonymous_context = None
         heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(job_id, attempt_no),
             name=f"ruoyi-heartbeat-{job_id}",
@@ -121,14 +122,18 @@ class RuoyiMediaWorker:
                 self.worker_id,
                 attempt_no,
                 progress=10,
-                stage="REFRESHING_ASSET_URLS"
+                stage="STARTING_ANONYMOUS_REFRESH"
                 if job["jobType"] == "POST_ASSET_REFRESH"
                 else "STARTING_BROWSER",
                 lease_seconds=self.lease_seconds,
             )
             collector.activate()
-            browser_context = await self.browser_session.get_context()
-            crawler = DouYinCrawler(browser_context=browser_context)
+            if job["jobType"] == "POST_ASSET_REFRESH":
+                anonymous_context = await self.browser_session.new_anonymous_context()
+                crawler = DouYinCrawler(browser_context=anonymous_context, allow_login=False)
+            else:
+                browser_context = await self.browser_session.get_context()
+                crawler = DouYinCrawler(browser_context=browser_context)
             await crawler.start()
             collector.deactivate()
 
@@ -175,7 +180,8 @@ class RuoyiMediaWorker:
                 self._update_post_media_status(ingest_payload)
             summary = await self._ingest_in_batches(job_id, attempt_no, ingest_payload)
             if job["jobType"] == "POST_ASSET_REFRESH":
-                summary["refreshMode"] = "DETAIL_RECRAWL"
+                summary["refreshMode"] = "ANONYMOUS_DETAIL_RECRAWL"
+                summary["authenticationMode"] = "ANONYMOUS"
                 summary["refreshedAssetTypes"] = sorted(
                     {
                         str(asset.get("assetType"))
@@ -240,6 +246,9 @@ class RuoyiMediaWorker:
             if crawler is not None:
                 with suppress(Exception):
                     await crawler.close()
+            if anonymous_context is not None:
+                with suppress(Exception):
+                    await anonymous_context.close()
 
     async def _download_stored_remote_assets(
         self,

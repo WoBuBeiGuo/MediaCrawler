@@ -58,6 +58,18 @@ class PersistentDouyinBrowser:
         async with self._lock:
             await self._close_unlocked()
 
+    async def new_anonymous_context(self) -> BrowserContext:
+        """Create an isolated context that cannot see the account login state."""
+        persistent_context = await self.get_context()
+        if persistent_context is None:
+            raise RuntimeError("Anonymous asset refresh requires CDP mode")
+        browser = persistent_context.browser
+        if browser is None or not browser.is_connected():
+            raise RuntimeError("Worker Chrome does not support isolated anonymous contexts")
+        context = await browser.new_context()
+        await context.add_init_script(path="libs/stealth.min.js")
+        return context
+
     def _is_usable(self) -> bool:
         if self._context is None or self._manager is None or not self._manager.is_connected():
             return False
