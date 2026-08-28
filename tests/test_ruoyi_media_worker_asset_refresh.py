@@ -174,3 +174,25 @@ async def test_anonymous_detail_uses_public_browser_page(monkeypatch: Any) -> No
 
     assert detail is not None
     assert detail["aweme_id"] == "7671641873538239744"
+
+
+class _SilentHeartbeatClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def heartbeat(self, *_args: Any, **_kwargs: Any) -> None:
+        self.calls += 1
+
+
+@pytest.mark.asyncio
+async def test_stop_heartbeat_finishes_without_sending_another_request() -> None:
+    client = _SilentHeartbeatClient()
+    worker = RuoyiMediaWorker(cast(Any, client), "test-worker", lease_seconds=30)
+    stop_event = asyncio.Event()
+    heartbeat_task = asyncio.create_task(worker._heartbeat_loop("1", 1, stop_event))
+
+    await asyncio.sleep(0)
+    await worker._stop_heartbeat(stop_event, heartbeat_task)
+
+    assert heartbeat_task.done()
+    assert client.calls == 0

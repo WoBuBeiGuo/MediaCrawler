@@ -103,8 +103,9 @@ class RuoyiMediaWorker:
         collector = DouyinJobCollector(request_payload)
         crawler: DouYinCrawler | None = None
         anonymous_context = None
+        heartbeat_stop = asyncio.Event()
         heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(job_id, attempt_no),
+            self._heartbeat_loop(job_id, attempt_no, heartbeat_stop),
             name=f"ruoyi-heartbeat-{job_id}",
         )
         try:
@@ -113,6 +114,8 @@ class RuoyiMediaWorker:
                     job_id,
                     attempt_no,
                     request_payload,
+                    heartbeat_stop=heartbeat_stop,
+                    heartbeat_task=heartbeat_task,
                 )
                 return
 
@@ -215,6 +218,7 @@ class RuoyiMediaWorker:
             summary["downloadFailures"] = download_failures
             storage_skipped = download_requested and self.storage is None
             summary["mediaStorageSkipped"] = storage_skipped
+            await self._stop_heartbeat(heartbeat_stop, heartbeat_task)
             await self.client.complete(
                 job_id,
                 self.worker_id,
@@ -227,6 +231,7 @@ class RuoyiMediaWorker:
             raise
         except Exception as exc:
             utils.logger.error(f"[RuoyiMediaWorker] job failed: {job_id}: {exc}\n{traceback.format_exc()}")
+            await self._stop_heartbeat(heartbeat_stop, heartbeat_task)
             with suppress(Exception):
                 await self.client.complete(
                     job_id,
@@ -242,9 +247,7 @@ class RuoyiMediaWorker:
                 )
         finally:
             collector.deactivate()
-            heartbeat_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await heartbeat_task
+            await self._stop_heartbeat(heartbeat_stop, heartbeat_task)
             if crawler is not None:
                 with suppress(Exception):
                     await crawler.close()
@@ -257,6 +260,9 @@ class RuoyiMediaWorker:
         job_id: str,
         attempt_no: int,
         request_payload: dict[str, Any],
+        *,
+        heartbeat_stop: asyncio.Event,
+        heartbeat_task: asyncio.Task[None],
     ) -> None:
         """Download DB-provided remote URLs without opening Douyin or using cookies."""
         assets = request_payload.get("assets") or []
@@ -272,6 +278,7 @@ class RuoyiMediaWorker:
             lease_seconds=self.lease_seconds,
         )
         if self.storage is None:
+            await self._stop_heartbeat(heartbeat_stop, heartbeat_task)
             await self.client.complete(
                 job_id,
                 self.worker_id,
@@ -327,6 +334,7 @@ class RuoyiMediaWorker:
             "mediaStorageSkipped": False,
             "downloadMode": "ANONYMOUS_HTTP",
         }
+        await self._stop_heartbeat(heartbeat_stop, heartbeat_task)
         await self.client.complete(
             job_id,
             self.worker_id,
@@ -344,16 +352,43 @@ class RuoyiMediaWorker:
             f"[RuoyiMediaWorker] anonymous remote download completed: {job_id}, summary={summary}"
         )
 
-    async def _heartbeat_loop(self, job_id: str, attempt_no: int) -> None:
+    async def _heartbeat_loop(
+        self,
+        job_id: str,
+        attempt_no: int,
+        stop_event: asyncio.Event,
+    ) -> None:
         interval = max(10, self.lease_seconds // 3)
-        while True:
-            await asyncio.sleep(interval)
-            await self.client.heartbeat(
-                job_id,
-                self.worker_id,
-                attempt_no,
-                stage="CRAWLING",
-                lease_seconds=self.lease_seconds,
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                await self.client.heartbeat(
+                    job_id,
+                    self.worker_id,
+                    attempt_no,
+                    stage="CRAWLING",
+                    lease_seconds=self.lease_seconds,
+                )
+
+    @staticmethod
+    async def _stop_heartbeat(
+        stop_event: asyncio.Event,
+        heartbeat_task: asyncio.Task[None],
+    ) -> None:
+        stop_event.set()
+        if heartbeat_task.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
+            return
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            utils.logger.warning(
+                f"[RuoyiMediaWorker] heartbeat stopped with an error before completion: {exc}"
             )
 
     async def _ingest_in_batches(
