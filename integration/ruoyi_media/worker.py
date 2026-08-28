@@ -147,6 +147,8 @@ class RuoyiMediaWorker:
             )
             ingest_payload = collector.build_ingest_payload()
             if not ingest_payload["posts"]:
+                if job["jobType"] == "POST_ASSET_REFRESH":
+                    raise RuntimeError("Douyin public work page returned no anonymous post data")
                 raise RuntimeError("Douyin crawl returned no post data")
             if job["jobType"] == "POST_ASSET_REFRESH":
                 actual_asset_types = {
@@ -180,7 +182,7 @@ class RuoyiMediaWorker:
                 self._update_post_media_status(ingest_payload)
             summary = await self._ingest_in_batches(job_id, attempt_no, ingest_payload)
             if job["jobType"] == "POST_ASSET_REFRESH":
-                summary["refreshMode"] = "ANONYMOUS_DETAIL_RECRAWL"
+                summary["refreshMode"] = "ANONYMOUS_PUBLIC_PAGE"
                 summary["authenticationMode"] = "ANONYMOUS"
                 summary["refreshedAssetTypes"] = sorted(
                     {

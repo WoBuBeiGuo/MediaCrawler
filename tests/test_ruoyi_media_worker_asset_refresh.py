@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 import config
@@ -95,6 +96,44 @@ class _ForbiddenLogin:
         raise AssertionError("anonymous refresh must not construct a login flow")
 
 
+class _AnonymousDetailResponse:
+    url = "https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=7671641873538239744"
+
+    async def json(self) -> dict[str, Any]:
+        return {
+            "aweme_detail": {
+                "aweme_id": "7671641873538239744",
+                "video": {"play_addr": {"url_list": ["https://example.test/video.mp4"]}},
+            }
+        }
+
+
+class _AnonymousPublicPage:
+    def __init__(self) -> None:
+        self._response_handler: Any = None
+
+    def on(self, event: str, handler: Any) -> None:
+        assert event == "response"
+        self._response_handler = handler
+
+    def remove_listener(self, event: str, handler: Any) -> None:
+        assert event == "response"
+        assert handler is self._response_handler
+        self._response_handler = None
+
+    async def goto(self, _url: str, **_kwargs: Any) -> None:
+        assert self._response_handler is not None
+        self._response_handler(_AnonymousDetailResponse())
+
+    async def evaluate(self, _script: str) -> list[Any]:
+        return []
+
+
+class _ForbiddenDetailClient:
+    async def get_video_by_id(self, _aweme_id: str) -> Any:
+        raise AssertionError("anonymous refresh must not use the direct HTTP detail API")
+
+
 @pytest.mark.asyncio
 async def test_anonymous_detail_never_falls_back_to_login(monkeypatch: Any) -> None:
     monkeypatch.setattr(config, "CRAWLER_TYPE", "detail")
@@ -119,3 +158,19 @@ async def test_anonymous_detail_never_falls_back_to_login(monkeypatch: Any) -> N
     assert detail_called is True
     assert client.cookie_updates == 1
     assert crawler._allow_login is False
+
+@pytest.mark.asyncio
+async def test_anonymous_detail_uses_public_browser_page(monkeypatch: Any) -> None:
+    monkeypatch.setattr(config, "CRAWLER_MIN_SLEEP_SEC", 0)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    crawler = DouYinCrawler(cast(Any, object()), allow_login=False)
+    crawler.context_page = cast(Any, _AnonymousPublicPage())
+    crawler.dy_client = cast(Any, _ForbiddenDetailClient())
+
+    detail = await crawler.get_aweme_detail(
+        "7671641873538239744",
+        asyncio.Semaphore(1),
+    )
+
+    assert detail is not None
+    assert detail["aweme_id"] == "7671641873538239744"

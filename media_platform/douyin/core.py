@@ -18,10 +18,12 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+import json
 import os
 import random
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 from playwright.async_api import (
     BrowserContext,
@@ -63,6 +65,39 @@ def _select_hot_comments_for_replies(comments: List[Dict[str, Any]]) -> List[Dic
         "first-level comments for reply collection"
     )
     return selected
+
+
+def _extract_aweme_from_page_payload(payload: Any, aweme_id: str, depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Find the requested aweme object in a browser API or hydration payload."""
+    if depth > 12:
+        return None
+    if isinstance(payload, dict):
+        if str(payload.get("aweme_id") or "") == str(aweme_id) and (
+            payload.get("video") or payload.get("images")
+        ):
+            return payload
+        for value in payload.values():
+            result = _extract_aweme_from_page_payload(value, aweme_id, depth + 1)
+            if result is not None:
+                return result
+    elif isinstance(payload, list):
+        for value in payload:
+            result = _extract_aweme_from_page_payload(value, aweme_id, depth + 1)
+            if result is not None:
+                return result
+    return None
+
+
+def _decode_page_payload(payload: Any) -> Any:
+    """Decode JSON embedded by Douyin in public-page hydration scripts."""
+    if not isinstance(payload, str):
+        return payload
+    for candidate in (payload, unquote(payload)):
+        try:
+            return json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 class DouYinCrawler(AbstractCrawler):
@@ -264,6 +299,13 @@ class DouYinCrawler(AbstractCrawler):
     async def get_aweme_detail(self, aweme_id: str, semaphore: asyncio.Semaphore) -> Any:
         """Get note detail"""
         async with semaphore:
+            if not self._allow_login:
+                result = await self.get_aweme_detail_from_public_page(aweme_id)
+                if result is None:
+                    utils.logger.error(
+                        f"[DouYinCrawler.get_aweme_detail] Public page returned no anonymous detail: {aweme_id}"
+                    )
+                return result
             try:
                 result = await self.dy_client.get_video_by_id(aweme_id)
                 return result
@@ -273,6 +315,82 @@ class DouYinCrawler(AbstractCrawler):
             except KeyError as ex:
                 utils.logger.error(f"[DouYinCrawler.get_aweme_detail] have not fund note detail aweme_id:{aweme_id}, err: {ex}")
                 return None
+
+    async def get_aweme_detail_from_public_page(self, aweme_id: str) -> Optional[Dict[str, Any]]:
+        """Read a public work through an isolated browser page without login cookies."""
+        target_url = f"https://www.douyin.com/video/{aweme_id}"
+        loop = asyncio.get_running_loop()
+        captured: asyncio.Future[Dict[str, Any]] = loop.create_future()
+        response_tasks: set[asyncio.Task[Any]] = set()
+
+        async def parse_response(response: Any) -> None:
+            if captured.done():
+                return
+            response_url = str(getattr(response, "url", "") or "")
+            if "douyin.com" not in response_url or "/aweme/v1/web/" not in response_url:
+                return
+            try:
+                payload = await response.json()
+            except Exception:
+                return
+            detail = _extract_aweme_from_page_payload(payload, aweme_id)
+            if detail is not None and not captured.done():
+                captured.set_result(detail)
+
+        def on_response(response: Any) -> None:
+            task = asyncio.create_task(parse_response(response))
+            response_tasks.add(task)
+            task.add_done_callback(response_tasks.discard)
+
+        self.context_page.on("response", on_response)
+        try:
+            min_sleep = max(0.0, float(getattr(config, "CRAWLER_MIN_SLEEP_SEC", 3)))
+            max_sleep = max(min_sleep, float(getattr(config, "CRAWLER_MAX_SLEEP_SEC", 7)))
+            if max_sleep > 0:
+                sleep_seconds = random.uniform(min_sleep, max_sleep)
+                utils.logger.info(
+                    f"[DouYinCrawler] Waiting {sleep_seconds:.2f}s before anonymous public-page refresh"
+                )
+                await asyncio.sleep(sleep_seconds)
+
+            utils.logger.info(f"[DouYinCrawler] Opening anonymous public work page: {target_url}")
+            await self.context_page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+            try:
+                return await asyncio.wait_for(asyncio.shield(captured), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+
+            page_payloads = await self.context_page.evaluate(
+                """
+                () => {
+                    const result = [];
+                    for (const id of ['RENDER_DATA', '__NEXT_DATA__']) {
+                        const node = document.getElementById(id);
+                        if (node && node.textContent) result.push(node.textContent);
+                    }
+                    for (const name of ['_SSR_HYDRATED_DATA', '__INITIAL_STATE__']) {
+                        try {
+                            if (window[name]) result.push(window[name]);
+                        } catch (_) {
+                            // Ignore site globals that cannot be serialized by Playwright.
+                        }
+                    }
+                    return result;
+                }
+                """
+            )
+            for page_payload in page_payloads or []:
+                detail = _extract_aweme_from_page_payload(
+                    _decode_page_payload(page_payload),
+                    aweme_id,
+                )
+                if detail is not None:
+                    return detail
+            return captured.result() if captured.done() else None
+        finally:
+            self.context_page.remove_listener("response", on_response)
+            if response_tasks:
+                await asyncio.gather(*response_tasks, return_exceptions=True)
 
     async def batch_get_note_comments(self, aweme_list: List[str]) -> None:
         """
