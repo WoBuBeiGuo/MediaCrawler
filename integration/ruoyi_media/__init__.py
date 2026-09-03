@@ -18,7 +18,18 @@
 
 """RuoYi Media worker integration."""
 
-from .client import RuoyiMediaClient, RuoyiMediaClientError
+from .client import (
+    RuoyiMediaClient,
+    RuoyiMediaClientError,
+    RuoyiMediaClientRejectedError,
+    RuoyiMediaClientTransportError,
+)
 from .collector import DouyinJobCollector
 
-__all__ = ["DouyinJobCollector", "RuoyiMediaClient", "RuoyiMediaClientError"]
+__all__ = [
+    "DouyinJobCollector",
+    "RuoyiMediaClient",
+    "RuoyiMediaClientError",
+    "RuoyiMediaClientRejectedError",
+    "RuoyiMediaClientTransportError",
+]

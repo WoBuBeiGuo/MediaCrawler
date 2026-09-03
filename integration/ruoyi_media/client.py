@@ -27,6 +27,14 @@ class RuoyiMediaClientError(RuntimeError):
     """Raised when the Java media service rejects a worker request."""
 
 
+class RuoyiMediaClientTransportError(RuoyiMediaClientError):
+    """Raised when the Java media service is temporarily unreachable."""
+
+
+class RuoyiMediaClientRejectedError(RuoyiMediaClientError):
+    """Raised when Java received and rejected a Worker request."""
+
+
 class RuoyiMediaClient:
     def __init__(
         self,
@@ -135,12 +143,26 @@ class RuoyiMediaClient:
         try:
             response = await self._client.post(path, json=payload)
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            if 400 <= exc.response.status_code < 500:
+                raise RuoyiMediaClientRejectedError(
+                    f"Worker API rejected HTTP request: {path}: {exc.response.status_code}"
+                ) from exc
+            raise RuoyiMediaClientTransportError(
+                f"Worker API request failed: {path}: {exc}"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise RuoyiMediaClientError(f"Worker API request failed: {path}: {exc}") from exc
+            raise RuoyiMediaClientTransportError(
+                f"Worker API request failed: {path}: {exc}"
+            ) from exc
         try:
             body = response.json()
         except ValueError as exc:
-            raise RuoyiMediaClientError(f"Worker API returned non-JSON response: {path}") from exc
+            raise RuoyiMediaClientTransportError(
+                f"Worker API returned non-JSON response: {path}"
+            ) from exc
         if body.get("code") != 200:
-            raise RuoyiMediaClientError(f"Worker API rejected request: {path}: {body.get('msg')}")
+            raise RuoyiMediaClientRejectedError(
+                f"Worker API rejected request: {path}: {body.get('msg')}"
+            )
         return body.get("data")

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, cast
 
 import config
@@ -16,6 +17,7 @@ import pytest
 import media_platform.douyin.core as douyin_core
 from media_platform.douyin.core import DouYinCrawler
 
+from integration.ruoyi_media.client import RuoyiMediaClientTransportError
 from integration.ruoyi_media.worker import RuoyiMediaWorker, SUPPORTED_JOB_TYPES
 
 
@@ -65,6 +67,37 @@ def test_creator_job_configures_excluded_member_posts(monkeypatch: Any) -> None:
     )
 
     assert config.DY_EXCLUDED_ID_LIST == ["7442341759184653577"]
+
+
+@pytest.mark.asyncio
+async def test_poll_transport_failure_is_a_single_warning_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = RuoyiMediaWorker(cast(Any, object()), "test-worker", poll_seconds=1)
+    poll_count = 0
+
+    async def fail_then_stop() -> bool:
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            raise RuoyiMediaClientTransportError("backend restarting")
+        raise asyncio.CancelledError
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(worker, "run_once", fail_then_stop)
+    monkeypatch.setattr(asyncio, "sleep", no_wait)
+
+    with caplog.at_level(logging.WARNING, logger="MediaCrawler"):
+        with pytest.raises(asyncio.CancelledError):
+            await worker.run_forever()
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "temporarily unavailable" in warnings[0].getMessage()
+    assert warnings[0].exc_info is None
 
 
 class _AnonymousPage:

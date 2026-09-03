@@ -31,7 +31,11 @@ from media_platform.douyin import DouYinCrawler
 from tools import utils
 
 from .browser_session import PersistentDouyinBrowser
-from .client import RuoyiMediaClient
+from .client import (
+    RuoyiMediaClient,
+    RuoyiMediaClientRejectedError,
+    RuoyiMediaClientTransportError,
+)
 from .collector import DouyinJobCollector
 from .object_storage import MinioAssetStorage, MinioStorageSettings
 
@@ -84,9 +88,24 @@ class RuoyiMediaWorker:
                 handled = await self.run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except RuoyiMediaClientTransportError as exc:
+                utils.logger.warning(
+                    f"[RuoyiMediaWorker] Java backend temporarily unavailable while polling; "
+                    f"retrying in {self.poll_seconds}s: {exc}"
+                )
+                await asyncio.sleep(self.poll_seconds)
+                continue
+            except RuoyiMediaClientRejectedError as exc:
                 utils.logger.error(
-                    f"[RuoyiMediaWorker] failed to claim a job; retrying in {self.poll_seconds}s: {exc}"
+                    f"[RuoyiMediaWorker] Java backend rejected the job claim; "
+                    f"check Worker Token and backend configuration: {exc}"
+                )
+                await asyncio.sleep(self.poll_seconds)
+                continue
+            except Exception as exc:
+                utils.logger.exception(
+                    f"[RuoyiMediaWorker] unexpected polling failure; "
+                    f"retrying in {self.poll_seconds}s: {exc}"
                 )
                 await asyncio.sleep(self.poll_seconds)
                 continue
